@@ -12,6 +12,14 @@ services:
     labels:
       com.datadoghq.ad.logs: '[{"source": "python", "service": "upload-service"}]'
 
+  audio-service:
+    build: ./audio-service
+    depends_on:
+      - minio
+      - rabbitmq
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "python", "service": "audio-service"}]'
+
   minio:
     image: quay.io/minio/minio
     ports:
