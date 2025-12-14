@@ -46,3 +46,24 @@ services:
       - DD_ENV=dev
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+
+
+  transcription-service:
+    build: ./transcription-service
+    depends_on:
+      - minio
+      - rabbitmq
+    environment:
+      - SERVICE_NAME=transcription-service
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=admin12345
+      - MINIO_BUCKET=therapy-sessions
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - AUDIO_READY_QUEUE=audio_ready
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "python", "service": "transcription-service"}]'
+
+

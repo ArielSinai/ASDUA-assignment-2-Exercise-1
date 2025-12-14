@@ -23,7 +23,7 @@ RABBITMQ_URL = os.getenv(
     "RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/"
 )
 RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "video_uploaded")
-
+AUDIO_READY_QUEUE = os.getenv("AUDIO_READY_QUEUE", "audio_ready")
 
 
 logger = logging.getLogger(SERVICE_NAME)
@@ -64,26 +64,31 @@ def init_minio() -> Minio:
 
 
 async def init_rabbitmq() -> tuple[aio_pika.RobustConnection,
-                                   aio_pika.Channel,
-                                   aio_pika.Queue]:
+                                  aio_pika.Channel,
+                                  aio_pika.Queue]:
     logger.info(f"Connecting to RabbitMQ at {RABBITMQ_URL} ...")
     conn = await aio_pika.connect_robust(RABBITMQ_URL)
     channel = await conn.channel()
-    await channel.set_qos(prefetch_count=5)
+    await channel.set_qos(prefetch_count=10)
 
-    queue = await channel.declare_queue(
+    # התור של הווידאו הקיים
+    video_queue = await channel.declare_queue(
         RABBITMQ_QUEUE, durable=True
     )
-    logger.info(f"RabbitMQ queue '{RABBITMQ_QUEUE}' declared (consumer)")
-    return conn, channel, queue  # type: ignore
+
+    # התור החדש – הודעה כשהאודיו מוכן
+    await channel.declare_queue(AUDIO_READY_QUEUE, durable=True)
+
+    logger.info(
+        f"RabbitMQ queues declared: video='{RABBITMQ_QUEUE}', audio='{AUDIO_READY_QUEUE}'"
+    )
+    return conn, channel, video_queue  # type: ignore
+
 
 
 
 def extract_audio_to_mp3(video_path: str, mp3_path: str) -> None:
-    """
-    מקבל path של וידאו ו-path ליצירת mp3.
-    משתמש ב-ffmpeg שיושב בתוך הקונטיינר.
-    """
+    
     cmd = [
         "ffmpeg",
         "-y",            # overwrite
@@ -136,10 +141,40 @@ async def handle_video_message(payload: dict[str, Any]) -> None:
             content_type="audio/mpeg",
         )
 
+                # אחרי fput_object(...)
+
         logger.info(
             f"Saved MP3 to MinIO: bucket='{bucket}', object='{mp3_object_name}', "
             f"from original='{original_filename}'"
         )
+
+        # שולחים הודעה לתור audio_ready
+        if rabbit_channel is not None:
+            msg_body: dict[str, Any] = {
+                "event": "audio_ready",
+                "bucket": bucket,
+                "object_name": mp3_object_name,
+                "original_video": object_name,
+                "original_filename": original_filename,
+            }
+            body_bytes = json.dumps(msg_body).encode("utf-8")
+
+            message = aio_pika.Message(
+                body=body_bytes,
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            )
+
+            await rabbit_channel.default_exchange.publish(
+                message, routing_key=AUDIO_READY_QUEUE
+            )
+            logger.info(
+                f"Published 'audio_ready' message for '{mp3_object_name}' "
+                f"to queue '{AUDIO_READY_QUEUE}'"
+            )
+        else:
+            logger.error("RabbitMQ channel not initialized – cannot publish audio_ready")
+
 
     except S3Error as e:
         logger.exception(f"MinIO error while processing video: {e}")
