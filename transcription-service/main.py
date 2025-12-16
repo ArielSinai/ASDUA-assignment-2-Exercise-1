@@ -16,17 +16,22 @@ from minio.error import S3Error
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "transcription-service")
 
-# MinIO config
+
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "admin12345")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "therapy-sessions")
 
-# RabbitMQ config
+
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
 AUDIO_READY_QUEUE = os.getenv("AUDIO_READY_QUEUE", "audio_ready")
+TRANSCRIPT_READY_QUEUE = os.getenv(
+    "TRANSCRIPT_READY_QUEUE",
+    "transcript_ready",
+)
 
-# AssemblyAI config
+
+
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
@@ -35,7 +40,7 @@ if not ASSEMBLYAI_API_KEY:
     raise RuntimeError("ASSEMBLYAI_API_KEY env var is required")
 
 
-# ---------- logging ----------
+
 
 logger = logging.getLogger(SERVICE_NAME)
 logger.setLevel(logging.INFO)
@@ -47,14 +52,14 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-# ---------- globals ----------
+
 
 minio_client: Minio | None = None
 rabbit_conn: AbstractRobustConnection | None = None
 rabbit_channel: AbstractChannel | None = None
 
 
-# ---------- MinIO ----------
+
 
 def init_minio() -> Minio:
     client = Minio(
@@ -67,7 +72,7 @@ def init_minio() -> Minio:
     return client
 
 
-# ---------- RabbitMQ ----------
+
 
 async def init_rabbitmq(
     url: str,
@@ -75,10 +80,7 @@ async def init_rabbitmq(
     retries: int = 15,
     delay_seconds: int = 4,
 ) -> tuple[AbstractRobustConnection, AbstractChannel, Queue]:
-    """
-    מנסה להתחבר ל־RabbitMQ כמה פעמים, עם הפסקה בין ניסיונות.
-    אם אחרי כל הניסיונות עדיין אין חיבור – מרים Exception.
-    """
+    
     last_exc: Exception | None = None
 
     for attempt in range(1, retries + 1):
@@ -102,7 +104,7 @@ async def init_rabbitmq(
             if attempt < retries:
                 await asyncio.sleep(delay_seconds)
 
-    # אם הגענו לכאן – כל הניסיונות נכשלו
+    
     logger.error(
         f"Giving up connecting to RabbitMQ after {retries} attempts. "
         f"Last error: {last_exc!r}"
@@ -112,7 +114,7 @@ async def init_rabbitmq(
     )
 
 
-# ---------- AssemblyAI helpers ----------
+
 
 async def upload_to_assemblyai(file_path: str) -> str:
     """Upload the MP3 file to AssemblyAI and return an upload_url (sync httpx in thread)."""
@@ -184,7 +186,7 @@ async def wait_for_transcription(transcript_id: str) -> dict[str, Any]:
                 if status == "error":
                     raise RuntimeError(data.get("error", "Unknown error"))
 
-                # שימי לב: זה בתוך thread, אז אין בעיה עם sleep רגיל
+                
                 import time
                 time.sleep(3)
 
@@ -198,7 +200,7 @@ def build_diarized_text(result: dict[str, Any]) -> str:
     """Build a human-readable diarized transcript from AssemblyAI result."""
     utterances = result.get("utterances", [])
     if not utterances:
-        # fallback – no diarization, just full text
+        
         return result.get("text", "")
 
     lines: list[str] = []
@@ -209,7 +211,6 @@ def build_diarized_text(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# ---------- main message handler ----------
 
 async def handle_audio_message(payload: dict[str, Any]) -> None:
     """Handle one 'audio_ready' message from RabbitMQ."""
@@ -229,7 +230,7 @@ async def handle_audio_message(payload: dict[str, Any]) -> None:
     )
 
     try:
-        # 1. Download MP3 from MinIO to a temp file
+        # Download MP3 from MinIO to a temp file
         response = minio_client.get_object(bucket, object_name)
         try:
             with tempfile.NamedTemporaryFile(
@@ -242,22 +243,22 @@ async def handle_audio_message(payload: dict[str, Any]) -> None:
             response.close()
             response.release_conn()
 
-        # 2. Upload to AssemblyAI
+        # Upload to AssemblyAI
         upload_url = await upload_to_assemblyai(mp3_path)
 
-        # 3. Start transcription with diarization
+        # Start transcription with diarization
         transcript_id = await start_transcription(upload_url)
 
-        # 4. Wait for completion
+        # Wait for completion
         result = await wait_for_transcription(transcript_id)
 
-        # 5. Build diarized text
+        # Build diarized text
         text = build_diarized_text(result)
         if not text:
             logger.warning("Empty transcription text")
             return
 
-        # 6. Save transcript to MinIO as .txt next to the mp3
+        # Save transcript to MinIO as .txt next to the mp3
         base_name = object_name.rsplit(".", 1)[0]
         transcript_name = f"{base_name}.txt"
 
@@ -277,6 +278,33 @@ async def handle_audio_message(payload: dict[str, Any]) -> None:
             f"object='{transcript_name}', "
             f"from original='{original_filename}'"
         )
+        
+                # Publish "transcript_ready" event to RabbitMQ
+        if rabbit_channel is not None:
+            msg_body = json.dumps(
+                {
+                    "event": "transcript_ready",
+                    "bucket": bucket,
+                    "object_name": transcript_name,
+                    "original_filename": original_filename,
+                }
+            ).encode("utf-8")
+
+            await rabbit_channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=msg_body,
+                    content_type="application/json",
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                ),
+                routing_key=TRANSCRIPT_READY_QUEUE,
+            )
+            logger.info(
+                f"Published 'transcript_ready' message to queue "
+                f"'{TRANSCRIPT_READY_QUEUE}'"
+            )
+        else:
+            logger.error("RabbitMQ channel is None – cannot publish transcript_ready")
+
 
     except S3Error as e:
         logger.exception(f"MinIO error while handling audio: {e}")
@@ -284,22 +312,22 @@ async def handle_audio_message(payload: dict[str, Any]) -> None:
         logger.exception(f"Unexpected error in transcription-service: {e}")
 
 
-# ---------- main loop ----------
+
 
 async def main() -> None:
     global minio_client, rabbit_conn, rabbit_channel
 
     logger.info(f"{SERVICE_NAME} starting up...")
 
-    # MinIO
+    
     minio_client = init_minio()
 
-    # RabbitMQ – עם יותר ניסיונות וזמן המתנה
+    
     rabbit_conn, rabbit_channel, queue = await init_rabbitmq(
         RABBITMQ_URL,
         AUDIO_READY_QUEUE,
-        retries=15,        # למשל 15 ניסיונות
-        delay_seconds=4,   # הפרש של 4 שניות ביניהם
+        retries=15,        
+        delay_seconds=4,   
     )
 
     async def on_message(message: IncomingMessage) -> None:
@@ -313,7 +341,7 @@ async def main() -> None:
 
     await queue.consume(on_message)
     logger.info("Waiting for 'audio_ready' messages...")
-    # keep running forever
+    
     await asyncio.Future()
 
 

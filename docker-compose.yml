@@ -62,8 +62,36 @@ services:
       - MINIO_BUCKET=therapy-sessions
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - AUDIO_READY_QUEUE=audio_ready
+      - TRANSCRIPT_READY_QUEUE=transcript_ready
       - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
     labels:
       com.datadoghq.ad.logs: '[{"source": "python", "service": "transcription-service"}]'
+
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  analysis-service:
+    build: ./analysis-service
+    depends_on:
+      - minio
+      - rabbitmq
+      - redis
+    environment:
+      - SERVICE_NAME=analysis-service
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=admin12345
+      - MINIO_BUCKET=therapy-sessions
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - TRANSCRIPT_READY_QUEUE=transcript_ready
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=gpt-4.1-mini
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "python", "service": "analysis-service"}]'
+
 
 
